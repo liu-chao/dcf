@@ -85,6 +85,18 @@ const static u8 mcs_to_resp_mcs[64] = {0, 0, 2, 2, 4, 4, 4, 4,
 									   0, 0, 0, 0, 0, 0, 0, 0,
 									   0, 0, 0, 0, 0, 0, 0, 0 };
 
+const u16 rssi_lookup_B24[61] = {1, 16, 24, 40, 56, 72, 80, 96, 112, 128, 144, 152, 168, 184, 200, 208, 224, 240,
+								256, 272, 280, 296, 312, 328, 336, 352, 368, 384, 400, 408, 424, 440, 456, 472,
+								480, 496, 512, 528, 536, 552, 568, 584, 600, 608, 624, 640, 656, 664, 680, 696,
+								712, 728, 736, 752, 768, 784, 792, 808, 824, 840, 856};
+
+const u16 rssi_lookup_B5[61] = {96, 112, 128, 144, 160, 168, 184, 200, 216, 224, 240, 256, 272, 288, 296, 312,
+							   328, 344, 352, 368, 384, 400, 416, 424, 440, 456, 472, 480, 496, 512, 528, 544,
+							   552, 568, 584, 600, 608, 624, 640, 656, 672, 680, 696, 712, 728, 736, 752, 768,
+							   784, 800, 808, 824, 840, 856, 864, 880, 896, 912, 920, 936, 952};
+
+
+
 
 /**
  * @brief Initialize MAC Low Framework
@@ -98,8 +110,8 @@ const static u8 mcs_to_resp_mcs[64] = {0, 0, 2, 2, 4, 4, 4, 4,
  *  - initialization status (0 = success)
  */
 int wlan_mac_low_init(u32 type){
-	u32 status;
-	rx_frame_info* rx_mpdu;
+	//u32 status;
+	//rx_frame_info* rx_mpdu;
 	wlan_ipc_msg ipc_msg_to_high;
 
 	mac_param_band = RC_24GHZ;
@@ -118,13 +130,13 @@ int wlan_mac_low_init(u32 type){
 	frame_tx_callback	   = (function_ptr_t)nullCallback;
 	ipc_low_param_callback = (function_ptr_t)nullCallback;
 
+#ifdef TEST_BCON_TRANS_LC
 	status = w3_node_init();
-
 	if(status != 0) {
 		xil_printf("Error in w3_node_init()! Exiting\n");
 		return -1;
 	}
-
+#endif
 	// TODO: This value should offset forward to the time when the timestamp bytes in the beacon are transmitter
 	wlan_mac_set_timestamp_offset(0);
 
@@ -137,6 +149,7 @@ int wlan_mac_low_init(u32 type){
 	//create IPC message to receive into
 	ipc_msg_from_high.payload_ptr = &(ipc_msg_from_high_payload[0]);
 
+#ifdef TEST_BCON_TRANS_LC
 	//Begin by trying to lock packet buffer 0 for wireless receptions
 	rx_pkt_buf = 0;
 	if(lock_pkt_buf_rx(rx_pkt_buf) != PKT_BUF_MUTEX_SUCCESS){
@@ -153,9 +166,16 @@ int wlan_mac_low_init(u32 type){
 	//Move the PHY's starting address into the packet buffers by PHY_XX_PKT_BUF_PHY_HDR_OFFSET.
 	//This accounts for the metadata located at the front of every packet buffer (Xx_mpdu_info)
 	wlan_phy_rx_pkt_buf_phy_hdr_offset(PHY_RX_PKT_BUF_PHY_HDR_OFFSET);
+
+#endif
+
 	wlan_phy_tx_pkt_buf_phy_hdr_offset(PHY_TX_PKT_BUF_PHY_HDR_OFFSET);
 
+#ifdef TEST_BCON_TRANS_LC
+	//don't have radio_controller_axi_v3_01_a bsp.151125-lc
 	wlan_radio_init();
+#endif
+
 	wlan_phy_init();
 	wlan_mac_low_dcf_init();
 
@@ -172,95 +192,228 @@ int wlan_mac_low_init(u32 type){
 	return 0;
 }
 
-inline u32 wlan_mac_low_poll_frame_rx(){
-	u32 return_status = 0;
-	phy_rx_details phy_details;
-	int i;
+/**
+ * @brief Initialize the DCF Hardware Core
+ *
+ * This function initializes the DCF hardware core.
+ *
+ * @param None
+ * @return None
+ */
+void wlan_mac_low_dcf_init(){
+	//u16 i;
+	//rx_frame_info* rx_mpdu;
 
-	//Read the MAC/PHY status
-	u32 mac_hw_status;
-	u32 mac_hw_phy_rx_params;
+#ifdef TEST_BCON_TRANS_LC
+	//Enable blocking of the Rx PHY following good-FCS receptions and bad-FCS receptions
+	// BLOCK_RX_ON_VALID_RXEND will block the Rx PHY on all RX_END events following valid RX_START events
+	//  This allows the wlan_exp framework to count and log bad FCS receptions
+	REG_SET_BITS(WLAN_MAC_REG_CONTROL, (WLAN_MAC_CTRL_MASK_RX_PHY_BLOCK_EN | WLAN_MAC_CTRL_MASK_BLOCK_RX_ON_TX | WLAN_MAC_CTRL_MASK_BLOCK_RX_ON_VALID_RXEND));
+#endif
 
-	mac_hw_status = wlan_mac_get_status();
+	//Enable the NAV counter
+	REG_CLEAR_BITS(WLAN_MAC_REG_CONTROL, (WLAN_MAC_CTRL_MASK_DISABLE_NAV ));
 
-	//xil_printf("mac_hw_status = 0x%08x\n", mac_hw_status);
+	//MAC timing parameters are in terms of units of 100 nanoseconds
+	wlan_mac_set_slot(T_SLOT*10);
 
-	//Check if PHY is currently receiving or has finished receiving
-	if( mac_hw_status & (WLAN_MAC_STATUS_MASK_RX_PHY_ACTIVE | WLAN_MAC_STATUS_MASK_RX_PHY_BLOCKED_FCS_GOOD | WLAN_MAC_STATUS_MASK_RX_PHY_BLOCKED) ) {
-		return_status |= POLL_MAC_STATUS_RECEIVED_PKT; //We received something in this poll
+	wlan_mac_set_DIFS((T_DIFS)*10);
+	wlan_mac_set_TxDIFS(((T_DIFS)*10) - (TX_PHY_DLY_100NSEC));
 
-		i = 0;
-		if(DBG_PRINT) xil_printf("MAC Rx: 0x%08x\n", mac_hw_status);
-		//Check whether this is an OFDM or DSSS Rx
-		if(wlan_mac_get_rx_phy_sel() == WLAN_MAC_PHY_RX_PARAMS_PHY_SEL_DSSS) {
-			//DSSS Rx - PHY Rx length is already valid, other params unused for DSSS
-			phy_details.phy_mode = PHY_RX_DETAILS_MODE_DSSS;
-			phy_details.N_DBPS = 0; //Invalid for DSSS
+	//Use postTx timer 2 for ACK timeout
+	wlan_mac_set_postTx_timer2(T_TIMEOUT * 10);
+	wlan_mac_postTx_timer2_en(1);
 
-			//Strip off extra pre-MAC-header bytes used in DSSS frames; this adjustment allows the next
-			// function to treat OFDM and DSSS payloads the same
-			phy_details.length = wlan_mac_get_rx_phy_length() - 5;
-			phy_details.mcs = WLAN_MAC_MCS_1M;
+#ifdef TEST_BCON_TRANS_LC
+	//Use postRx timer 1 for SIFS
+	wlan_mac_set_postRx_timer1((T_SIFS*10)-(TX_PHY_DLY_100NSEC));
+	wlan_mac_postRx_timer1_en(1);
+#endif
 
-			if(DBG_PRINT) xil_printf("DSSS Rx callback: %d / %d / %d\n", phy_details.phy_mode, phy_details.length, phy_details.mcs);
+	//TODO: NAV adjust needs verification
+	//NAV adjust time - signed char (Fix8_0) value
+	wlan_mac_set_NAV_adj(0*10);
+	wlan_mac_set_EIFS(T_EIFS*10);
 
-			//Call the user callback to handle this Rx, capture return value
-			return_status |= frame_rx_callback(rx_pkt_buf, &phy_details);
+#ifdef TEST_BCON_TRANS_LC
+	//Clear any stale Rx events
+	wlan_mac_dcf_hw_unblock_rx_phy();
 
-			if(DBG_PRINT) xil_printf("DSSS Rx callback return: 0x%08x\n", return_status);
-
-		} else {
-			//OFDM Rx - must wait for PHY_RX_PARAMS to be valid before reading mcs/length
-			do {
-				mac_hw_phy_rx_params = wlan_mac_get_rx_params();
-				if(DBG_PRINT) xil_printf("MAC Rx Poll 1 (%4d): 0x%08x  0x%08x\n", i++, mac_hw_phy_rx_params, wlan_mac_get_status());
-
-			} while((mac_hw_phy_rx_params & WLAN_MAC_PHY_RX_PARAMS_MASK_PARAMS_VALID) == 0);
-			i = 0;
-			//Check if PHY is continuing Rx (11a: valid SIGNAL, 11n: valid+supported HT-SIG)
-			if( (mac_hw_phy_rx_params & (WLAN_MAC_PHY_RX_PARAMS_MASK_UNSUPPORTED | WLAN_MAC_PHY_RX_PARAMS_MASK_RX_ERROR))) {
-				//PHY is not processing this Rx - do not call user callback
-				return_status = return_status & ~POLL_MAC_STATUS_RECEIVED_PKT;
-
-				//Wait for PHY to finish, then clear block
-				do {
-					mac_hw_status = wlan_mac_get_status();
-					if(DBG_PRINT) xil_printf("MAC Rx Poll 2 (%4d): 0x%08x  0x%08x\n", i++, mac_hw_phy_rx_params, wlan_mac_get_status());
-				} while(mac_hw_status & WLAN_MAC_STATUS_MASK_RX_PHY_ACTIVE);
-
-				wlan_mac_dcf_hw_unblock_rx_phy();
-
-			} else {
-				//PHY is processing this Rx - read mcs/length/phy-mode
-				phy_details.phy_mode = wlan_mac_get_rx_phy_mode();
-				phy_details.length = wlan_mac_get_rx_phy_length();
-				phy_details.mcs = wlan_mac_get_rx_phy_mcs();
-
-				phy_details.N_DBPS = wlan_mac_mcs_to_n_dbps(phy_details.mcs);
-
-				if(DBG_PRINT) xil_printf("OFDM Rx callback: %d / %d / %d\n", phy_details.phy_mode, phy_details.length, phy_details.mcs);
-
-				//Call the user callback to handle this Rx, capture return value
-				return_status |= frame_rx_callback(rx_pkt_buf, &phy_details);
-
-				if(DBG_PRINT) xil_printf("OFDM Rx callback return: 0x%08x\n", return_status);
-			}
-		}
-
-		//Current frame_rx_callback() always unblocks PHY
-		// uncomment this unblock_rx_phy if custom frame_rx_callback does not wait to unblock the PHY
-		//wlan_mac_dcf_hw_unblock_rx_phy();
+	for(i=0;i < NUM_RX_PKT_BUFS; i++){
+		rx_mpdu = (rx_frame_info*)RX_PKT_BUF_TO_ADDR(i);
+		rx_mpdu->state = RX_MPDU_STATE_EMPTY;
 	}
-
-	return return_status;
+#endif
 }
 
+
+/**
+ * @brief Initialize Hardware Info Struct
+ *
+ * This function initializes the hardware info struct with values read from the EEPROM.
+ *
+ * @param None
+ * @return None
+ */
+void wlan_mac_low_init_hw_info( u32 type ) {
+
+	// Initialize the wlan_mac_hw_info structure to all zeros
+	//
+	memset( (void*)( &hw_info ), 0x0, sizeof( wlan_mac_hw_info ) );
+
+	// Set General Node information
+	hw_info.type          = type;
+    hw_info.serial_number = w3_eeprom_readSerialNum(EEPROM_BASEADDR);
+    hw_info.fpga_dna[1]   = w3_eeprom_read_fpga_dna(EEPROM_BASEADDR, 1);
+    hw_info.fpga_dna[0]   = w3_eeprom_read_fpga_dna(EEPROM_BASEADDR, 0);
+
+    // Set HW Addresses
+    //   - NOTE:  The w3_eeprom_readEthAddr() function handles the case when the WARP v3
+    //     hardware does not have a valid Ethernet address
+    //
+    // Use address 0 for the WLAN interface, address 1 for the Ethernet interface
+	w3_eeprom_readEthAddr(EEPROM_BASEADDR, 0, hw_info.hw_addr_wlan);
+	w3_eeprom_readEthAddr(EEPROM_BASEADDR, 1, hw_info.hw_addr_wn);
+
+    // WARPNet will use ethernet device 1 (ETH_B) by default
+    hw_info.wn_eth_device = 1;
+
+    // Set the NAV ignore addr to this HW address
+    wlan_mac_set_nav_check_addr( hw_info.hw_addr_wlan );
+}
+
+/**
+ * @brief Get the Current Microsecond Timestamp
+ *
+ * This function returns the current timestamp of the system
+ *
+ * @param None
+ * @return u64
+ * - microsecond timestamp
+ */
+inline u64 get_usec_timestamp(){
+
+	//The MAC core register interface is only 32-bit, so the 64-bit timestamp
+	// is read from two 32-bit registers and reconstructed here.
+
+	u32 timestamp_high_u32;
+	u32 timestamp_low_u32;
+	u64 timestamp_u64;
+
+	timestamp_high_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_MSB);
+	timestamp_low_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_LSB);
+
+	//Catch very rare race when 32-LSB of 64-bit value wraps between the two 32-bit reads
+	if( (timestamp_high_u32 & 0x1) != (Xil_In32(WLAN_MAC_REG_TIMESTAMP_MSB) & 0x1) ) {
+		//32-LSB wrapped - start over
+		timestamp_high_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_MSB);
+		timestamp_low_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_LSB);
+	}
+
+	timestamp_u64 = (((u64)timestamp_high_u32)<<32) + ((u64)timestamp_low_u32);
+
+	return timestamp_u64;
+}
+
+/**
+ * @brief Convert dBm to Tx Gain Target
+ *
+ * This function maps a transmit power (in dBm) to a radio gain target.
+ *
+ * @param s8 power
+ * @return u8 gain_target
+ * - gain target in range of [0,63]
+ */
+inline u8 wlan_mac_low_dbm_to_gain_target(s8 power){
+	s8 power_railed;
+	u8 return_value;
+
+	if(power > TX_POWER_MAX_DBM){
+		power_railed = TX_POWER_MAX_DBM;
+	} else if( power < TX_POWER_MIN_DBM){
+		power_railed = TX_POWER_MIN_DBM;
+	} else {
+		power_railed = power;
+	}
+
+	//return_value = (u8)(2*power_railed + 20);
+
+	//This is only save because 'power' is constrained to less
+	//than half the dynamic range of an s8 type
+	return_value = (u8)((power_railed << 1) + 20);
+
+	return return_value;
+}
+
+/**
+ * @brief Return Current Channel Selection
+ *
+ * This function returns the the current channel.
+ *
+ * @param None
+ * @return None
+ */
+inline u32 wlan_mac_low_get_active_channel(){
+	return mac_param_chan;
+}
+
+/**
+ * @brief Get the Tx Start Microsecond Timestamp
+ *
+ * This function returns the Tx start timestamp of the system
+ *
+ * @param None
+ * @return u64
+ * - microsecond timestamp
+ */
+inline u64 get_tx_start_timestamp() {
+
+	u32 timestamp_high_u32;
+	u32 timestamp_low_u32;
+	u64 timestamp_u64;
+
+	//TX_START timestamp is captured once per transmission - no race condition between 32-bit reads
+	timestamp_high_u32 = Xil_In32(WLAN_MAC_REG_TX_TIMESTAMP_MSB);
+	timestamp_low_u32 = Xil_In32(WLAN_MAC_REG_TX_TIMESTAMP_LSB);
+	timestamp_u64 = (((u64)timestamp_high_u32)<<32) + ((u64)timestamp_low_u32);
+
+	return timestamp_u64;
+}
 
 u8 wlan_mac_low_get_cw_exp_min(){
 	return cw_exp_min;
 }
+
 u8 wlan_mac_low_get_cw_exp_max(){
 	return cw_exp_max;
+}
+
+/**
+ * @brief Return Hardware Info Struct
+ *
+ * This function returns the hardware info struct stored in the MAC Low Framework
+ *
+ * @param None
+ * @return None
+ */
+inline wlan_mac_hw_info* wlan_mac_low_get_hw_info(){
+	return &hw_info;
+}
+
+/**
+ * @brief Set Frame Transmission Callback
+ *
+ * Tells the framework which function should be called when
+ * an MPDU is passed down from the upper-level MAC for
+ * wireless transmission
+ *
+ * @param function_ptr_t callback
+ *  - Pointer to callback function
+ * @return None
+ *
+ */
+inline void wlan_mac_low_set_frame_tx_callback(function_ptr_t callback){
+	frame_tx_callback = callback;
 }
 
 /**
@@ -285,52 +438,19 @@ void wlan_mac_low_finish_init(){
 }
 
 /**
- * @brief Initialize the DCF Hardware Core
+ * @brief Poll for IPC Receptions
  *
- * This function initializes the DCF hardware core.
+ * This function is a non-blocking poll for IPC receptions from the
+ * upper-level MAC.
  *
  * @param None
  * @return None
  */
-void wlan_mac_low_dcf_init(){
-	u16 i;
-	rx_frame_info* rx_mpdu;
-
-	//Enable blocking of the Rx PHY following good-FCS receptions and bad-FCS receptions
-	// BLOCK_RX_ON_VALID_RXEND will block the Rx PHY on all RX_END events following valid RX_START events
-	//  This allows the wlan_exp framework to count and log bad FCS receptions
-	REG_SET_BITS(WLAN_MAC_REG_CONTROL, (WLAN_MAC_CTRL_MASK_RX_PHY_BLOCK_EN | WLAN_MAC_CTRL_MASK_BLOCK_RX_ON_TX | WLAN_MAC_CTRL_MASK_BLOCK_RX_ON_VALID_RXEND));
-
-	//Enable the NAV counter
-	REG_CLEAR_BITS(WLAN_MAC_REG_CONTROL, (WLAN_MAC_CTRL_MASK_DISABLE_NAV ));
-
-	//MAC timing parameters are in terms of units of 100 nanoseconds
-	wlan_mac_set_slot(T_SLOT*10);
-
-	wlan_mac_set_DIFS((T_DIFS)*10);
-	wlan_mac_set_TxDIFS(((T_DIFS)*10) - (TX_PHY_DLY_100NSEC));
-
-	//Use postTx timer 2 for ACK timeout
-	wlan_mac_set_postTx_timer2(T_TIMEOUT * 10);
-	wlan_mac_postTx_timer2_en(1);
-
-	//Use postRx timer 1 for SIFS
-	wlan_mac_set_postRx_timer1((T_SIFS*10)-(TX_PHY_DLY_100NSEC));
-	wlan_mac_postRx_timer1_en(1);
-
-	//TODO: NAV adjust needs verification
-	//NAV adjust time - signed char (Fix8_0) value
-	wlan_mac_set_NAV_adj(0*10);
-	wlan_mac_set_EIFS(T_EIFS*10);
-
-	//Clear any stale Rx events
-	wlan_mac_dcf_hw_unblock_rx_phy();
-
-	for(i=0;i < NUM_RX_PKT_BUFS; i++){
-		rx_mpdu = (rx_frame_info*)RX_PKT_BUF_TO_ADDR(i);
-		rx_mpdu->state = RX_MPDU_STATE_EMPTY;
+inline void wlan_mac_low_poll_ipc_rx(){
+	//Poll mailbox read msg
+	if(ipc_mailbox_read_msg(&ipc_msg_from_high) == IPC_MBOX_SUCCESS){
+		process_ipc_msg_from_high(&ipc_msg_from_high);
 	}
-
 }
 
 /**
@@ -366,20 +486,10 @@ inline void wlan_mac_low_send_exception(u32 reason){
 	}
 }
 
-/**
- * @brief Poll for IPC Receptions
- *
- * This function is a non-blocking poll for IPC receptions from the
- * upper-level MAC.
- *
- * @param None
- * @return None
- */
-inline void wlan_mac_low_poll_ipc_rx(){
-	//Poll mailbox read msg
-	if(ipc_mailbox_read_msg(&ipc_msg_from_high) == IPC_MBOX_SUCCESS){
-		process_ipc_msg_from_high(&ipc_msg_from_high);
-	}
+void wlan_mac_set_nav_check_addr(u8* addr) {
+	Xil_Out32(WLAN_MAC_REG_NAV_CHECK_ADDR_1, *((u32*)&(addr[0])) );
+	Xil_Out32(WLAN_MAC_REG_NAV_CHECK_ADDR_2, *((u32*)&(addr[4])) );
+	return;
 }
 
 /**
@@ -754,6 +864,87 @@ void process_ipc_msg_from_high(wlan_ipc_msg* msg){
 	}
 }
 
+inline u8 wlan_mac_mcs_to_phy_rate(u8 mcs){
+	if( ((mcs >=0) && (mcs < WLAN_MAC_NUM_MCS)) || (mcs == WLAN_MAC_MCS_1M)){
+		return mcs_to_phy_rate_lut[mcs];
+	} else {
+		xil_printf("Invalid MCS index %0x%x\n", mcs);
+		return mcs_to_phy_rate_lut[0];
+	}
+}
+
+inline u8 wlan_mac_mcs_to_n_dbps(u8 mcs){
+	if( ((mcs >=0) && (mcs < WLAN_MAC_NUM_MCS)) || (mcs == WLAN_MAC_MCS_1M)){
+		return mcs_to_n_dbps_lut[mcs];
+	} else {
+		xil_printf("Invalid MCS index %0x%x\n", mcs);
+		return mcs_to_n_dbps_lut[0];
+	}
+}
+
+inline u8 wlan_mac_mcs_to_ctrl_resp_mcs(u8 mcs){
+	//Returns the fastest half-rate MCS lower than the provided MCS and
+	//no larger that 24Mbps.
+
+	u8 return_value = mcs;
+	if(return_value > 4){
+		return_value = 4;
+	}
+
+	if(return_value%2){
+		return_value--;
+	}
+
+	return return_value;
+}
+
+/**
+ * @brief Map the WLAN channel frequencies onto the convention used by the radio controller
+ */
+inline u32 wlan_mac_low_wlan_chan_to_rc_chan(u32 mac_channel) {
+	int return_value = 0;
+
+	if(mac_channel >= 36){
+		//5GHz Channel we need to tweak gain settings
+		//so that tx power settings are accurate
+		radio_controller_setRadioParam(RC_BASEADDR, RC_ALL_RF, RC_PARAMID_TXGAIN_BB, 3);
+	} else {
+		radio_controller_setRadioParam(RC_BASEADDR, RC_ALL_RF, RC_PARAMID_TXGAIN_BB, 1);
+	}
+
+	switch(mac_channel){
+		//2.4GHz channels
+		case 1:
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+		case 6:
+		case 7:
+		case 8:
+		case 9:
+		case 10:
+		case 11:
+			return_value = mac_channel;
+		break;
+		//5GHz channels
+		case 36: //5180MHz
+			return_value = 1;
+		break;
+		case 40: //5200MHz
+			return_value = 2;
+		break;
+		case 44: //5220MHz
+			return_value = 3;
+		break;
+		case 48: //5240MHz
+			return_value = 4;
+		break;
+	}
+
+	return return_value;
+}
+
 /**
  * @brief Set MAC microsecond timer
  *
@@ -775,65 +966,156 @@ void wlan_mac_low_set_time(u64 new_time) {
 	Xil_Out32(WLAN_MAC_REG_CONTROL, (Xil_In32(WLAN_MAC_REG_CONTROL) & ~WLAN_MAC_CTRL_MASK_UPDATE_TIMESTAMP));
 }
 
+int wlan_mac_low_set_pkt_det_min_power(s8 rx_pow){
+	int rssi_val;
 
-/**
- * @brief Initialize Hardware Info Struct
- *
- * This function initializes the hardware info struct with values read from the EEPROM.
- *
- * @param None
- * @return None
- */
-void wlan_mac_low_init_hw_info( u32 type ) {
+	rssi_val = wlan_mac_low_rx_power_to_rssi(rx_pow);
 
-	// Initialize the wlan_mac_hw_info structure to all zeros
-	//
-	memset( (void*)( &hw_info ), 0x0, sizeof( wlan_mac_hw_info ) );
+	if(rssi_val != -1){
+		wlan_phy_rx_pktDet_RSSI_cfg( (PHY_RX_RSSI_SUM_LEN-1), (rssi_val << PHY_RX_RSSI_SUM_LEN_BITS), 1);
+		return 0;
+	} else {
+		return -1;
+	}
 
-	// Set General Node information
-	hw_info.type          = type;
-    hw_info.serial_number = w3_eeprom_readSerialNum(EEPROM_BASEADDR);
-    hw_info.fpga_dna[1]   = w3_eeprom_read_fpga_dna(EEPROM_BASEADDR, 1);
-    hw_info.fpga_dna[0]   = w3_eeprom_read_fpga_dna(EEPROM_BASEADDR, 0);
+}
 
-    // Set HW Addresses
-    //   - NOTE:  The w3_eeprom_readEthAddr() function handles the case when the WARP v3
-    //     hardware does not have a valid Ethernet address
-    //
-    // Use address 0 for the WLAN interface, address 1 for the Ethernet interface
-	w3_eeprom_readEthAddr(EEPROM_BASEADDR, 0, hw_info.hw_addr_wlan);
-	w3_eeprom_readEthAddr(EEPROM_BASEADDR, 1, hw_info.hw_addr_wn);
+int wlan_mac_low_rx_power_to_rssi(s8 rx_pow){
+	//rx_pow must be in the range [-90,-30] inclusive
 
-    // WARPNet will use ethernet device 1 (ETH_B) by default
-    hw_info.wn_eth_device = 1;
+	u8 band;
+	u16 rssi_val = 0;
 
-    // Set the NAV ignore addr to this HW address
-    wlan_mac_set_nav_check_addr( hw_info.hw_addr_wlan );
+	band = mac_param_band;
+
+	if( (rx_pow <= PKT_DET_MIN_POWER_MAX) && (rx_pow >= PKT_DET_MIN_POWER_MIN)){
+
+		if(band == RC_24GHZ){
+			rssi_val = rssi_lookup_B24[rx_pow-PKT_DET_MIN_POWER_MIN];
+		} else if(band == RC_5GHZ){
+			rssi_val = rssi_lookup_B5[rx_pow-PKT_DET_MIN_POWER_MIN];
+		}
+		return rssi_val;
+	} else {
+		return -1;
+	}
 }
 
 /**
- * @brief Return Hardware Info Struct
- *
- * This function returns the hardware info struct stored in the MAC Low Framework
- *
- * @param None
- * @return None
+ * @brief Force reset NAV counter in MAC hardware
  */
-inline wlan_mac_hw_info* wlan_mac_low_get_hw_info(){
-	return &hw_info;
+inline void wlan_mac_reset_NAV_counter() {
+	Xil_Out32(WLAN_MAC_REG_CONTROL, Xil_In32(WLAN_MAC_REG_CONTROL) | WLAN_MAC_CTRL_MASK_RESET_NAV);
+	Xil_Out32(WLAN_MAC_REG_CONTROL, Xil_In32(WLAN_MAC_REG_CONTROL) & ~WLAN_MAC_CTRL_MASK_RESET_NAV);
+	return;
 }
 
-/**
- * @brief Return Current Channel Selection
- *
- * This function returns the the current channel.
- *
- * @param None
- * @return None
- */
-inline u32 wlan_mac_low_get_active_channel(){
-	return mac_param_chan;
+
+
+#ifdef TEST_BCON_TRANS_LC
+inline u32 wlan_mac_low_poll_frame_rx(){
+	u32 return_status = 0;
+	phy_rx_details phy_details;
+	int i;
+
+	//Read the MAC/PHY status
+	u32 mac_hw_status;
+	u32 mac_hw_phy_rx_params;
+
+	mac_hw_status = wlan_mac_get_status();
+
+	//xil_printf("mac_hw_status = 0x%08x\n", mac_hw_status);
+
+	//Check if PHY is currently receiving or has finished receiving
+	if( mac_hw_status & (WLAN_MAC_STATUS_MASK_RX_PHY_ACTIVE | WLAN_MAC_STATUS_MASK_RX_PHY_BLOCKED_FCS_GOOD | WLAN_MAC_STATUS_MASK_RX_PHY_BLOCKED) ) {
+		return_status |= POLL_MAC_STATUS_RECEIVED_PKT; //We received something in this poll
+
+		i = 0;
+		if(DBG_PRINT) xil_printf("MAC Rx: 0x%08x\n", mac_hw_status);
+		//Check whether this is an OFDM or DSSS Rx
+		if(wlan_mac_get_rx_phy_sel() == WLAN_MAC_PHY_RX_PARAMS_PHY_SEL_DSSS) {
+			//DSSS Rx - PHY Rx length is already valid, other params unused for DSSS
+			phy_details.phy_mode = PHY_RX_DETAILS_MODE_DSSS;
+			phy_details.N_DBPS = 0; //Invalid for DSSS
+
+			//Strip off extra pre-MAC-header bytes used in DSSS frames; this adjustment allows the next
+			// function to treat OFDM and DSSS payloads the same
+			phy_details.length = wlan_mac_get_rx_phy_length() - 5;
+			phy_details.mcs = WLAN_MAC_MCS_1M;
+
+			if(DBG_PRINT) xil_printf("DSSS Rx callback: %d / %d / %d\n", phy_details.phy_mode, phy_details.length, phy_details.mcs);
+
+			//Call the user callback to handle this Rx, capture return value
+			return_status |= frame_rx_callback(rx_pkt_buf, &phy_details);
+
+			if(DBG_PRINT) xil_printf("DSSS Rx callback return: 0x%08x\n", return_status);
+
+		} else {
+			//OFDM Rx - must wait for PHY_RX_PARAMS to be valid before reading mcs/length
+			do {
+				mac_hw_phy_rx_params = wlan_mac_get_rx_params();
+				if(DBG_PRINT) xil_printf("MAC Rx Poll 1 (%4d): 0x%08x  0x%08x\n", i++, mac_hw_phy_rx_params, wlan_mac_get_status());
+
+			} while((mac_hw_phy_rx_params & WLAN_MAC_PHY_RX_PARAMS_MASK_PARAMS_VALID) == 0);
+			i = 0;
+			//Check if PHY is continuing Rx (11a: valid SIGNAL, 11n: valid+supported HT-SIG)
+			if( (mac_hw_phy_rx_params & (WLAN_MAC_PHY_RX_PARAMS_MASK_UNSUPPORTED | WLAN_MAC_PHY_RX_PARAMS_MASK_RX_ERROR))) {
+				//PHY is not processing this Rx - do not call user callback
+				return_status = return_status & ~POLL_MAC_STATUS_RECEIVED_PKT;
+
+				//Wait for PHY to finish, then clear block
+				do {
+					mac_hw_status = wlan_mac_get_status();
+					if(DBG_PRINT) xil_printf("MAC Rx Poll 2 (%4d): 0x%08x  0x%08x\n", i++, mac_hw_phy_rx_params, wlan_mac_get_status());
+				} while(mac_hw_status & WLAN_MAC_STATUS_MASK_RX_PHY_ACTIVE);
+
+				wlan_mac_dcf_hw_unblock_rx_phy();
+
+			} else {
+				//PHY is processing this Rx - read mcs/length/phy-mode
+				phy_details.phy_mode = wlan_mac_get_rx_phy_mode();
+				phy_details.length = wlan_mac_get_rx_phy_length();
+				phy_details.mcs = wlan_mac_get_rx_phy_mcs();
+
+				phy_details.N_DBPS = wlan_mac_mcs_to_n_dbps(phy_details.mcs);
+
+				if(DBG_PRINT) xil_printf("OFDM Rx callback: %d / %d / %d\n", phy_details.phy_mode, phy_details.length, phy_details.mcs);
+
+				//Call the user callback to handle this Rx, capture return value
+				return_status |= frame_rx_callback(rx_pkt_buf, &phy_details);
+
+				if(DBG_PRINT) xil_printf("OFDM Rx callback return: 0x%08x\n", return_status);
+			}
+		}
+
+		//Current frame_rx_callback() always unblocks PHY
+		// uncomment this unblock_rx_phy if custom frame_rx_callback does not wait to unblock the PHY
+		//wlan_mac_dcf_hw_unblock_rx_phy();
+	}
+
+	return return_status;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 inline s8 wlan_mac_low_get_current_ctrl_tx_pow(){
 	return mac_param_ctrl_tx_pow;
@@ -876,52 +1158,10 @@ const s8 pow_lookup_B5[128] = {-97, -97, -96, -96, -95, -94, -94, -93, -93, -92,
 							   -43, -43, -42, -42, -41, -40, -40, -39, -39, -38, -38, -37, -36, -36, -35, -35,
 							   -34, -34, -33, -32, -32, -31, -31, -30, -30, -29, -29, -28, -27, -27, -26, -26};
 
-const u16 rssi_lookup_B24[61] = {1, 16, 24, 40, 56, 72, 80, 96, 112, 128, 144, 152, 168, 184, 200, 208, 224, 240,
-								256, 272, 280, 296, 312, 328, 336, 352, 368, 384, 400, 408, 424, 440, 456, 472,
-								480, 496, 512, 528, 536, 552, 568, 584, 600, 608, 624, 640, 656, 664, 680, 696,
-								712, 728, 736, 752, 768, 784, 792, 808, 824, 840, 856};
-
-const u16 rssi_lookup_B5[61] = {96, 112, 128, 144, 160, 168, 184, 200, 216, 224, 240, 256, 272, 288, 296, 312,
-							   328, 344, 352, 368, 384, 400, 416, 424, 440, 456, 472, 480, 496, 512, 528, 544,
-							   552, 568, 584, 600, 608, 624, 640, 656, 672, 680, 696, 712, 728, 736, 752, 768,
-							   784, 800, 808, 824, 840, 856, 864, 880, 896, 912, 920, 936, 952};
 
 
-int wlan_mac_low_rx_power_to_rssi(s8 rx_pow){
-	//rx_pow must be in the range [-90,-30] inclusive
-
-	u8 band;
-	u16 rssi_val = 0;
-
-	band = mac_param_band;
-
-	if( (rx_pow <= PKT_DET_MIN_POWER_MAX) && (rx_pow >= PKT_DET_MIN_POWER_MIN)){
-
-		if(band == RC_24GHZ){
-			rssi_val = rssi_lookup_B24[rx_pow-PKT_DET_MIN_POWER_MIN];
-		} else if(band == RC_5GHZ){
-			rssi_val = rssi_lookup_B5[rx_pow-PKT_DET_MIN_POWER_MIN];
-		}
-		return rssi_val;
-	} else {
-		return -1;
-	}
-}
 
 
-int wlan_mac_low_set_pkt_det_min_power(s8 rx_pow){
-	int rssi_val;
-
-	rssi_val = wlan_mac_low_rx_power_to_rssi(rx_pow);
-
-	if(rssi_val != -1){
-		wlan_phy_rx_pktDet_RSSI_cfg( (PHY_RX_RSSI_SUM_LEN-1), (rssi_val << PHY_RX_RSSI_SUM_LEN_BITS), 1);
-		return 0;
-	} else {
-		return -1;
-	}
-
-}
 
 inline int wlan_mac_low_calculate_rx_power(u16 rssi, u8 lna_gain){
 
@@ -1004,21 +1244,7 @@ inline void wlan_mac_low_set_frame_rx_callback(function_ptr_t callback){
 	frame_rx_callback = callback;
 }
 
-/**
- * @brief Set Frame Transmission Callback
- *
- * Tells the framework which function should be called when
- * an MPDU is passed down from the upper-level MAC for
- * wireless transmission
- *
- * @param function_ptr_t callback
- *  - Pointer to callback function
- * @return None
- *
- */
-inline void wlan_mac_low_set_frame_tx_callback(function_ptr_t callback){
-	frame_tx_callback = callback;
-}
+
 
 /**
  * @brief Set IPC_MBOX_LOW_PARAM Callback
@@ -1094,38 +1320,6 @@ inline void wlan_mac_low_lock_empty_rx_pkt_buf(){
 	}
 }
 
-/**
- * @brief Get the Current Microsecond Timestamp
- *
- * This function returns the current timestamp of the system
- *
- * @param None
- * @return u64
- * - microsecond timestamp
- */
-inline u64 get_usec_timestamp(){
-
-	//The MAC core register interface is only 32-bit, so the 64-bit timestamp
-	// is read from two 32-bit registers and reconstructed here.
-
-	u32 timestamp_high_u32;
-	u32 timestamp_low_u32;
-	u64 timestamp_u64;
-
-	timestamp_high_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_MSB);
-	timestamp_low_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_LSB);
-
-	//Catch very rare race when 32-LSB of 64-bit value wraps between the two 32-bit reads
-	if( (timestamp_high_u32 & 0x1) != (Xil_In32(WLAN_MAC_REG_TIMESTAMP_MSB) & 0x1) ) {
-		//32-LSB wrapped - start over
-		timestamp_high_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_MSB);
-		timestamp_low_u32 = Xil_In32(WLAN_MAC_REG_TIMESTAMP_LSB);
-	}
-
-	timestamp_u64 = (((u64)timestamp_high_u32)<<32) + ((u64)timestamp_low_u32);
-
-	return timestamp_u64;
-}
 
 /**
  * @brief Get the Rx Start Microsecond Timestamp
@@ -1150,28 +1344,7 @@ inline u64 get_rx_start_timestamp() {
 }
 
 
-/**
- * @brief Get the Tx Start Microsecond Timestamp
- *
- * This function returns the Tx start timestamp of the system
- *
- * @param None
- * @return u64
- * - microsecond timestamp
- */
-inline u64 get_tx_start_timestamp() {
 
-	u32 timestamp_high_u32;
-	u32 timestamp_low_u32;
-	u64 timestamp_u64;
-
-	//TX_START timestamp is captured once per transmission - no race condition between 32-bit reads
-	timestamp_high_u32 = Xil_In32(WLAN_MAC_REG_TX_TIMESTAMP_MSB);
-	timestamp_low_u32 = Xil_In32(WLAN_MAC_REG_TX_TIMESTAMP_LSB);
-	timestamp_u64 = (((u64)timestamp_high_u32)<<32) + ((u64)timestamp_low_u32);
-
-	return timestamp_u64;
-}
 
 /**
  * @brief Unblock the Receive PHY
@@ -1228,35 +1401,6 @@ inline u32 wlan_mac_dcf_hw_rx_finish(){
 	}
 }
 
-/**
- * @brief Convert dBm to Tx Gain Target
- *
- * This function maps a transmit power (in dBm) to a radio gain target.
- *
- * @param s8 power
- * @return u8 gain_target
- * - gain target in range of [0,63]
- */
-inline u8 wlan_mac_low_dbm_to_gain_target(s8 power){
-	s8 power_railed;
-	u8 return_value;
-
-	if(power > TX_POWER_MAX_DBM){
-		power_railed = TX_POWER_MAX_DBM;
-	} else if( power < TX_POWER_MIN_DBM){
-		power_railed = TX_POWER_MIN_DBM;
-	} else {
-		power_railed = power;
-	}
-
-	//return_value = (u8)(2*power_railed + 20);
-
-	//This is only save because 'power' is constrained to less
-	//than half the dynamic range of an s8 type
-	return_value = (u8)((power_railed << 1) + 20);
-
-	return return_value;
-}
 
 /**
  * @brief Force reset backoff counter in MAC hardware
@@ -1267,100 +1411,15 @@ inline void wlan_mac_reset_backoff_counter() {
 	return;
 }
 
-/**
- * @brief Force reset NAV counter in MAC hardware
- */
-inline void wlan_mac_reset_NAV_counter() {
-	Xil_Out32(WLAN_MAC_REG_CONTROL, Xil_In32(WLAN_MAC_REG_CONTROL) | WLAN_MAC_CTRL_MASK_RESET_NAV);
-	Xil_Out32(WLAN_MAC_REG_CONTROL, Xil_In32(WLAN_MAC_REG_CONTROL) & ~WLAN_MAC_CTRL_MASK_RESET_NAV);
-	return;
-}
 
-/**
- * @brief Map the WLAN channel frequencies onto the convention used by the radio controller
- */
-inline u32 wlan_mac_low_wlan_chan_to_rc_chan(u32 mac_channel) {
-	int return_value = 0;
 
-	if(mac_channel >= 36){
-		//5GHz Channel we need to tweak gain settings
-		//so that tx power settings are accurate
-		radio_controller_setRadioParam(RC_BASEADDR, RC_ALL_RF, RC_PARAMID_TXGAIN_BB, 3);
-	} else {
-		radio_controller_setRadioParam(RC_BASEADDR, RC_ALL_RF, RC_PARAMID_TXGAIN_BB, 1);
-	}
 
-	switch(mac_channel){
-		//2.4GHz channels
-		case 1:
-		case 2:
-		case 3:
-		case 4:
-		case 5:
-		case 6:
-		case 7:
-		case 8:
-		case 9:
-		case 10:
-		case 11:
-			return_value = mac_channel;
-		break;
-		//5GHz channels
-		case 36: //5180MHz
-			return_value = 1;
-		break;
-		case 40: //5200MHz
-			return_value = 2;
-		break;
-		case 44: //5220MHz
-			return_value = 3;
-		break;
-		case 48: //5240MHz
-			return_value = 4;
-		break;
-	}
 
-	return return_value;
-}
 
-void wlan_mac_set_nav_check_addr(u8* addr) {
-	Xil_Out32(WLAN_MAC_REG_NAV_CHECK_ADDR_1, *((u32*)&(addr[0])) );
-	Xil_Out32(WLAN_MAC_REG_NAV_CHECK_ADDR_2, *((u32*)&(addr[4])) );
-	return;
-}
 
-inline u8 wlan_mac_mcs_to_n_dbps(u8 mcs){
-	if( ((mcs >=0) && (mcs < WLAN_MAC_NUM_MCS)) || (mcs == WLAN_MAC_MCS_1M)){
-		return mcs_to_n_dbps_lut[mcs];
-	} else {
-		xil_printf("Invalid MCS index %0x%x\n", mcs);
-		return mcs_to_n_dbps_lut[0];
-	}
-}
 
-inline u8 wlan_mac_mcs_to_phy_rate(u8 mcs){
-	if( ((mcs >=0) && (mcs < WLAN_MAC_NUM_MCS)) || (mcs == WLAN_MAC_MCS_1M)){
-		return mcs_to_phy_rate_lut[mcs];
-	} else {
-		xil_printf("Invalid MCS index %0x%x\n", mcs);
-		return mcs_to_phy_rate_lut[0];
-	}
-}
 
-inline u8 wlan_mac_mcs_to_ctrl_resp_mcs(u8 mcs){
-	//Returns the fastest half-rate MCS lower than the provided MCS and
-	//no larger that 24Mbps.
 
-	u8 return_value = mcs;
-	if(return_value > 4){
-		return_value = 4;
-	}
 
-	if(return_value%2){
-		return_value--;
-	}
-
-	return return_value;
-}
-
+#endif
 

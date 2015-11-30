@@ -281,9 +281,13 @@ void wlan_tx_config_ant_mode(u32 ant_mode) {
 void wlan_phy_init() {
 
 	//Assert Tx and Rx resets
+
+#ifdef TEST_BCON_TRANS_LC
 	REG_SET_BITS(WLAN_RX_REG_CTRL, WLAN_RX_REG_CTRL_RESET);
+#endif
 	REG_SET_BITS(WLAN_TX_REG_CFG, WLAN_TX_REG_CFG_RESET);
 
+#ifdef TEST_BCON_TRANS_LC
 /************ PHY Rx ************/
 
 	//Enable DSSS Rx by default
@@ -358,7 +362,7 @@ void wlan_phy_init() {
 	//Configure channel estimate capture (64 subcarriers, 4 bytes each)
 	// Chan ests start at sizeof(rx_frame_info) - sizeof(chan_est)
 	wlan_phy_rx_pkt_buf_h_est_offset((PHY_RX_PKT_BUF_PHY_HDR_OFFSET - (64*4)));
-	
+#endif
 
 /************ PHY Tx ************/
 	
@@ -374,8 +378,10 @@ void wlan_phy_init() {
 	//  and for DAC->RF frontend to finish output Tx waveform
 	wlan_phy_tx_set_txen_extension(50);
 
+#ifdef TEST_BCON_TRANS_LC
 	//Set extension from RF Rx -> Tx to un-blocking Rx samples
 	wlan_phy_tx_set_rx_invalid_extension(150); //100
+#endif
 
 	//Set digital scaling of preamble/payload signals before DACs (UFix12_0)
 	//wlan_phy_tx_set_scaling(0x2800, 0x2800); //Scaling of 2.5
